@@ -22,6 +22,7 @@ Equipo del proyecto:
 
 import datetime
 import io
+import os
 import re
 import unicodedata
 from difflib import SequenceMatcher
@@ -190,13 +191,43 @@ def generar_excel_bytes(df_export: pd.DataFrame, nombre_hoja: str = "Importacion
     return buffer.getvalue()
 
 
+def _calcular_ean13_fallback(indice_producto: int) -> str:
+    """Genera un EAN-13 válido determinístico si la base cargada no traía EAN_UPC."""
+    base_12 = f"6901234{indice_producto:05d}"
+    suma = sum(int(d) * (1 if i % 2 == 0 else 3) for i, d in enumerate(base_12))
+    digito_control = (10 - (suma % 10)) % 10
+    return f"{base_12}{digito_control}"
+
+
 @st.cache_data
 def cargar_csv_base(ruta: str = "importaciones_china_colombia.csv") -> pd.DataFrame:
-    df_b = pd.read_csv(ruta, dtype={"EAN_UPC": str, "Partida_Arancelaria": str})
-    if "EAN_UPC" not in df_b.columns:
-        df_b["EAN_UPC"] = ""
+    """
+    Carga la base maestra CSV. Si el archivo no existe o está vacío (EmptyDataError / 0 bytes),
+    lo regenera automáticamente en el servidor usando generar_datos.py.
+    """
+    necesita_regenerar = (not os.path.exists(ruta)) or (os.path.getsize(ruta) == 0)
+    df_b = None
+
+    if not necesita_regenerar:
+        try:
+            df_b = pd.read_csv(ruta, dtype={"EAN_UPC": str, "Partida_Arancelaria": str})
+            if df_b.empty or len(df_b.columns) == 0:
+                necesita_regenerar = True
+        except pd.errors.EmptyDataError:
+            necesita_regenerar = True
+
+    if necesita_regenerar or df_b is None:
+        from generar_datos import generar_base_datos
+        df_b = generar_base_datos(ruta_salida=ruta, semilla=42)
+
+    if "EAN_UPC" not in df_b.columns or (df_b["EAN_UPC"].astype(str).str.strip() == "").all():
+        skus_unicos = df_b["SKU"].drop_duplicates().tolist()
+        mapa_ean = {sku: _calcular_ean13_fallback(idx) for idx, sku in enumerate(skus_unicos, start=1)}
+        df_b["EAN_UPC"] = df_b["SKU"].map(mapa_ean).fillna("")
+
     if "Partida_Arancelaria" not in df_b.columns:
         df_b["Partida_Arancelaria"] = df_b["Categoria"].map(PARTIDAS_DIAN_DEFAULT).fillna("")
+
     df_b["EAN_UPC"] = df_b["EAN_UPC"].apply(limpiar_codigo_texto)
     df_b["Partida_Arancelaria"] = df_b["Partida_Arancelaria"].apply(limpiar_codigo_texto)
     return df_b
