@@ -14,5 +14,5 @@ Integrantes:
 - Compatibilidad con **SKUs propios** en la plantilla CSV: acepta cualquier código interno de la empresa (ej. `EMP-001`) sin exigir prefijo `SR-`.
 
 ## Próximas mejoras (basadas en comentarios de clase)
-- Lectura directa de archivos Excel (`.xlsx`) y generación automática de SKU con `pd.factorize` cuando el archivo no traiga esa columna.
+- Lectura directa de archivos Excel (`.xlsx`) (actualmente solo lee CSV) y generación automática de SKU con `pd.factorize` cuando el archivo no traiga esa columna.
 - Cruce de productos externos contra la base de mercado usando código de barras (EAN/UPC) o partida arancelaria DIAN.
