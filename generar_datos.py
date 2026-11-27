@@ -6,34 +6,11 @@ Construye una base de datos comercial reproducible y sustentable en Python (NumP
   - 120 productos reales de importación China -> Colombia distribuidos en 10 categorías
   - 24 meses históricos (Enero 2025 - Diciembre 2026)
   - 5 ciudades principales de Colombia (Bogotá, Medellín, Cali, Barranquilla, Bucaramanga)
-  - Identificadores universales determinísticos por producto: EAN_UPC (EAN-13 válido) y Partida_Arancelaria (DIAN)
-  - Total: 14,400 registros x 24 columnas (0 valores nulos)
+  - Total: 14,400 registros x 22 columnas (0 valores nulos)
 """
 
 import numpy as np
 import pandas as pd
-
-PARTIDAS_DIAN_POR_CATEGORIA = {
-    "Tecnología": "8528.62.00.00",
-    "Hogar Inteligente": "8509.80.20.00",
-    "Belleza y Cuidado": "8543.70.90.00",
-    "Deportes y Fitness": "9506.91.00.00",
-    "Accesorios y Moda": "4202.92.00.00",
-    "Mascotas y Eco": "3924.90.00.00",
-    "Iluminación y Solar": "9405.42.00.00",
-    "Cocina y Mini-Electro": "8509.40.10.00",
-    "Gaming y Setup": "8471.60.20.00",
-    "Bebés y Juguetería": "9503.00.99.00",
-}
-
-
-def calcular_ean13(indice_producto: int) -> str:
-    """Genera un código de barras EAN-13 válido (prefijo GS1 China 690) determinístico."""
-    base_12 = f"6901234{indice_producto:05d}"
-    suma = sum(int(d) * (1 if i % 2 == 0 else 3) for i, d in enumerate(base_12))
-    digito_control = (10 - (suma % 10)) % 10
-    return f"{base_12}{digito_control}"
-
 
 
 def generar_base_datos(ruta_salida: str = "importaciones_china_colombia.csv", semilla: int = 42) -> pd.DataFrame:
@@ -220,10 +197,8 @@ def generar_base_datos(ruta_salida: str = "importaciones_china_colombia.csv", se
         factor_est = estacionalidad[mes - 1]
         progreso_anual = idx_t / 12.0
 
-        for idx_prod, (sku, prod, cat, fob, arancel, peso, transp,
-             dem_base, comp_base, tend_anual, perfil, rating_base, dev_base) in enumerate(catalogo, start=1):
-            ean_upc = calcular_ean13(idx_prod)
-            partida_dian = PARTIDAS_DIAN_POR_CATEGORIA.get(cat, "8543.70.90.00")
+        for (sku, prod, cat, fob, arancel, peso, transp,
+             dem_base, comp_base, tend_anual, perfil, rating_base, dev_base) in catalogo:
 
             if transp == "Marítimo":
                 flete_usd = round(max(0.45, peso * np.random.uniform(1.15, 1.55)), 2)
@@ -273,8 +248,6 @@ def generar_base_datos(ruta_salida: str = "importaciones_china_colombia.csv", se
                     "Anio": anio,
                     "Mes": mes,
                     "SKU": sku,
-                    "EAN_UPC": ean_upc,
-                    "Partida_Arancelaria": partida_dian,
                     "Producto": prod,
                     "Categoria": cat,
                     "Ciudad_Destino": ciudad,

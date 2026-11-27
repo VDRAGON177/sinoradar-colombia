@@ -1,15 +1,10 @@
 """
-SinoRadar Colombia v2.1 - Plataforma de Inteligencia Comercial para Importaciones China -> Colombia
-Desarrollado en Python con Pandas, NumPy, Plotly, OpenPyXL y Streamlit.
+SinoRadar Colombia v2.0 - Plataforma de Inteligencia Comercial para Importaciones China -> Colombia
+Desarrollado en Python con Pandas, NumPy, Plotly y Streamlit.
 
 Características principales:
   - Base de datos inicial de 14,400 registros (120 productos reales x 24 meses x 5 ciudades x 10 categorías)
-    con identificadores universales EAN_UPC y Partida_Arancelaria (DIAN)
-  - Carga directa de archivos Excel (.xlsx / .xls) y CSV en modo Combinar (pd.concat) o Reemplazar
-  - Manejo inteligente de SKU: respeta SKUs propios de la empresa o los autogenera con pd.factorize
-    si el archivo llega sin columna SKU (o con celdas vacías)
-  - Cruce automático de productos externos contra la base de mercado por EAN/UPC, Partida Arancelaria DIAN
-    o similitud de nombre (difflib.SequenceMatcher), con prueba interactiva en 1 clic
+  - Carga masiva de nuevos datos vía CSV (modo Combinar con pd.concat o Reemplazar)
   - Formulario en vivo para registrar nuevas importaciones y ver su impacto inmediato en KPIs y Semáforo
   - Motor analítico vectorizado en NumPy y Pandas
 
@@ -21,12 +16,6 @@ Equipo del proyecto:
 """
 
 import datetime
-import io
-import os
-import re
-import unicodedata
-from difflib import SequenceMatcher
-
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -111,403 +100,36 @@ CUSTOM_CSS = """
     .insight-red   { border-left-color: #EF4444; }
     button[data-baseweb="tab"] {
         font-weight: 600 !important;
-        font-size: 0.88rem !important;
+        font-size: 0.90rem !important;
     }
 </style>
 """
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
-COLUMNAS_MAESTRAS = [
-    "Fecha", "Anio", "Mes", "SKU", "EAN_UPC", "Partida_Arancelaria",
-    "Producto", "Categoria", "Ciudad_Destino", "Tipo_Transporte",
-    "Puerto_Entrada", "Tiempo_Transito_Dias", "TRM_COP", "Precio_FOB_USD",
-    "Flete_Unitario_USD", "Arancel_Pct", "IVA_Pct", "Costo_Aterrizado_COP",
-    "Precio_Venta_Mercado_COP", "Unidades_Importadas", "Unidades_Vendidas",
-    "Competidores_Activos", "Calificacion_Mercado", "Tasa_Devolucion_Pct",
-]
-
-# Columnas mínimas que debe traer un archivo externo de empresa
-# (SKU, Anio, Mes, EAN_UPC, Partida_Arancelaria, Costo_Aterrizado_COP, etc. se completan automáticamente si faltan)
-COLUMNAS_MINIMAS_EXTERNO = [
-    "Fecha", "Producto", "Categoria", "Ciudad_Destino", "Tipo_Transporte",
-    "TRM_COP", "Precio_FOB_USD", "Flete_Unitario_USD", "Arancel_Pct",
-    "Precio_Venta_Mercado_COP", "Unidades_Importadas", "Unidades_Vendidas",
+COLUMNAS_REQUERIDAS = [
+    "Fecha", "Anio", "Mes", "SKU", "Producto", "Categoria", "Ciudad_Destino",
+    "Tipo_Transporte", "Puerto_Entrada", "Tiempo_Transito_Dias", "TRM_COP",
+    "Precio_FOB_USD", "Flete_Unitario_USD", "Arancel_Pct", "IVA_Pct",
+    "Costo_Aterrizado_COP", "Precio_Venta_Mercado_COP", "Unidades_Importadas",
+    "Unidades_Vendidas", "Competidores_Activos", "Calificacion_Mercado",
+    "Tasa_Devolucion_Pct"
 ]
 
 NOMBRES_MESES = {
     1: "Ene", 2: "Feb", 3: "Mar", 4: "Abr", 5: "May", 6: "Jun",
-    7: "Jul", 8: "Ago", 9: "Sep", 10: "Oct", 11: "Nov", 12: "Dic",
-}
-
-PARTIDAS_DIAN_DEFAULT = {
-    "Tecnología": "8528.62.00.00",
-    "Hogar Inteligente": "8509.80.20.00",
-    "Belleza y Cuidado": "8543.70.90.00",
-    "Deportes y Fitness": "9506.91.00.00",
-    "Accesorios y Moda": "4202.92.00.00",
-    "Mascotas y Eco": "3924.90.00.00",
-    "Iluminación y Solar": "9405.42.00.00",
-    "Cocina y Mini-Electro": "8509.40.10.00",
-    "Gaming y Setup": "8471.60.20.00",
-    "Bebés y Juguetería": "9503.00.99.00",
+    7: "Jul", 8: "Ago", 9: "Sep", 10: "Oct", 11: "Nov", 12: "Dic"
 }
 
 if "registros_manuales" not in st.session_state:
     st.session_state["registros_manuales"] = []
-if "usar_demo_excel_sin_sku" not in st.session_state:
-    st.session_state["usar_demo_excel_sin_sku"] = False
 
 
 # ==============================================================================
-# 2. MOTOR DE DATOS, INGESTA INTELIGENTE (EXCEL/CSV/SKU) Y CRUCE DE MERCADO
+# 2. MOTOR DE DATOS Y CÁLCULO ANALÍTICO (PANDAS + NUMPY)
 # ==============================================================================
-def normalizar_texto(texto: object) -> str:
-    """Normaliza texto quitando tildes y símbolos para comparación y llaves consistentes."""
-    s = "" if pd.isna(texto) else str(texto).strip().lower()
-    s = unicodedata.normalize("NFKD", s)
-    s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    s = re.sub(r"[^a-z0-9\s]+", " ", s)
-    return re.sub(r"\s+", " ", s).strip()
-
-
-def limpiar_codigo_texto(valor: object) -> str:
-    """Limpia códigos leídos desde Excel (evita '.0' en EAN numéricos o textos 'nan')."""
-    if pd.isna(valor):
-        return ""
-    s = str(valor).strip()
-    if s.lower() in ("nan", "none", "null", ""):
-        return ""
-    if re.fullmatch(r"\d+\.0", s):
-        s = s[:-2]
-    return s
-
-
-def generar_excel_bytes(df_export: pd.DataFrame, nombre_hoja: str = "Importaciones") -> bytes:
-    """Exporta un DataFrame a bytes .xlsx en memoria usando OpenPyXL."""
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        df_export.to_excel(writer, index=False, sheet_name=nombre_hoja)
-    buffer.seek(0)
-    return buffer.getvalue()
-
-
-def _calcular_ean13_fallback(indice_producto: int) -> str:
-    """Genera un EAN-13 válido determinístico si la base cargada no traía EAN_UPC."""
-    base_12 = f"6901234{indice_producto:05d}"
-    suma = sum(int(d) * (1 if i % 2 == 0 else 3) for i, d in enumerate(base_12))
-    digito_control = (10 - (suma % 10)) % 10
-    return f"{base_12}{digito_control}"
-
-
 @st.cache_data
 def cargar_csv_base(ruta: str = "importaciones_china_colombia.csv") -> pd.DataFrame:
-    """
-    Carga la base maestra CSV. Si el archivo no existe o está vacío (EmptyDataError / 0 bytes),
-    lo regenera automáticamente en el servidor usando generar_datos.py.
-    """
-    necesita_regenerar = (not os.path.exists(ruta)) or (os.path.getsize(ruta) == 0)
-    df_b = None
-
-    if not necesita_regenerar:
-        try:
-            df_b = pd.read_csv(ruta, dtype={"EAN_UPC": str, "Partida_Arancelaria": str})
-            if df_b.empty or len(df_b.columns) == 0:
-                necesita_regenerar = True
-        except pd.errors.EmptyDataError:
-            necesita_regenerar = True
-
-    if necesita_regenerar or df_b is None:
-        from generar_datos import generar_base_datos
-        df_b = generar_base_datos(ruta_salida=ruta, semilla=42)
-
-    if "EAN_UPC" not in df_b.columns or (df_b["EAN_UPC"].astype(str).str.strip() == "").all():
-        skus_unicos = df_b["SKU"].drop_duplicates().tolist()
-        mapa_ean = {sku: _calcular_ean13_fallback(idx) for idx, sku in enumerate(skus_unicos, start=1)}
-        df_b["EAN_UPC"] = df_b["SKU"].map(mapa_ean).fillna("")
-
-    if "Partida_Arancelaria" not in df_b.columns:
-        df_b["Partida_Arancelaria"] = df_b["Categoria"].map(PARTIDAS_DIAN_DEFAULT).fillna("")
-
-    df_b["EAN_UPC"] = df_b["EAN_UPC"].apply(limpiar_codigo_texto)
-    df_b["Partida_Arancelaria"] = df_b["Partida_Arancelaria"].apply(limpiar_codigo_texto)
-    return df_b
-
-
-def crear_dataset_demo_empresa_sin_sku(df_mercado: pd.DataFrame) -> pd.DataFrame:
-    """
-    Crea un Excel realista de ejemplo (10 filas: 5 productos x 2 meses) SIN columna SKU
-    ni Costo_Aterrizado_COP para demostrar:
-      1) Autogeneración determinística de SKU con pd.factorize
-      2) Cálculo aduanero automático
-      3) Cruce contra el mercado por EAN/UPC, Partida Arancelaria DIAN y similitud de nombre
-    """
-    mapa_ean = (
-        df_mercado[["SKU", "EAN_UPC"]]
-        .drop_duplicates()
-        .set_index("SKU")["EAN_UPC"]
-        .to_dict()
-    )
-    ean_bel01 = mapa_ean.get("SR-BEL-01", "6901234000252")
-    ean_tec03 = mapa_ean.get("SR-TEC-03", "6901234000030")
-
-    filas = [
-        # 1) Cruce por EAN exacto (producto Luz Verde SR-BEL-01) - 2 meses
-        {
-            "Fecha": "2026-10-01", "Producto": "Masajeador Facial LED Microcorrientes",
-            "Categoria": "Belleza y Cuidado", "Ciudad_Destino": "Bogotá", "Tipo_Transporte": "Aéreo",
-            "EAN_UPC": ean_bel01, "Partida_Arancelaria": "8543.70.90.00",
-            "TRM_COP": 4210.0, "Precio_FOB_USD": 6.20, "Flete_Unitario_USD": 1.70, "Arancel_Pct": 0.15,
-            "Precio_Venta_Mercado_COP": 119000, "Unidades_Importadas": 260, "Unidades_Vendidas": 242,
-        },
-        {
-            "Fecha": "2026-11-01", "Producto": "Masajeador Facial LED Microcorrientes",
-            "Categoria": "Belleza y Cuidado", "Ciudad_Destino": "Medellín", "Tipo_Transporte": "Aéreo",
-            "EAN_UPC": ean_bel01, "Partida_Arancelaria": "8543.70.90.00",
-            "TRM_COP": 4240.0, "Precio_FOB_USD": 6.20, "Flete_Unitario_USD": 1.65, "Arancel_Pct": 0.15,
-            "Precio_Venta_Mercado_COP": 122000, "Unidades_Importadas": 300, "Unidades_Vendidas": 280,
-        },
-        # 2) Cruce por Similitud de Nombre + Categoría (sin EAN y sin Partida -> SR-TEC-01) - 2 meses
-        {
-            "Fecha": "2026-10-01", "Producto": "Proyector mini HD portatil wifi",
-            "Categoria": "Tecnología", "Ciudad_Destino": "Bogotá", "Tipo_Transporte": "Aéreo",
-            "EAN_UPC": "", "Partida_Arancelaria": "",
-            "TRM_COP": 4210.0, "Precio_FOB_USD": 22.80, "Flete_Unitario_USD": 6.00, "Arancel_Pct": 0.05,
-            "Precio_Venta_Mercado_COP": 399000, "Unidades_Importadas": 150, "Unidades_Vendidas": 138,
-        },
-        {
-            "Fecha": "2026-11-01", "Producto": "Proyector mini HD portatil wifi",
-            "Categoria": "Tecnología", "Ciudad_Destino": "Cali", "Tipo_Transporte": "Aéreo",
-            "EAN_UPC": "", "Partida_Arancelaria": "",
-            "TRM_COP": 4240.0, "Precio_FOB_USD": 22.80, "Flete_Unitario_USD": 6.10, "Arancel_Pct": 0.05,
-            "Precio_Venta_Mercado_COP": 395000, "Unidades_Importadas": 120, "Unidades_Vendidas": 109,
-        },
-        # 3) Cruce por EAN exacto (producto Alto Riesgo SR-TEC-03) - 2 meses
-        {
-            "Fecha": "2026-10-01", "Producto": "Reloj Inteligente Deportivo Pantalla AMOLED",
-            "Categoria": "Tecnología", "Ciudad_Destino": "Bogotá", "Tipo_Transporte": "Aéreo",
-            "EAN_UPC": ean_tec03, "Partida_Arancelaria": "8528.62.00.00",
-            "TRM_COP": 4210.0, "Precio_FOB_USD": 11.80, "Flete_Unitario_USD": 1.35, "Arancel_Pct": 0.05,
-            "Precio_Venta_Mercado_COP": 105000, "Unidades_Importadas": 350, "Unidades_Vendidas": 225,
-        },
-        {
-            "Fecha": "2026-11-01", "Producto": "Reloj Inteligente Deportivo Pantalla AMOLED",
-            "Categoria": "Tecnología", "Ciudad_Destino": "Medellín", "Tipo_Transporte": "Aéreo",
-            "EAN_UPC": ean_tec03, "Partida_Arancelaria": "8528.62.00.00",
-            "TRM_COP": 4240.0, "Precio_FOB_USD": 11.80, "Flete_Unitario_USD": 1.35, "Arancel_Pct": 0.05,
-            "Precio_Venta_Mercado_COP": 102000, "Unidades_Importadas": 280, "Unidades_Vendidas": 175,
-        },
-        # 4) Cruce por Partida Arancelaria DIAN (sin EAN, nombre distinto a catálogo -> familia Cocina) - 2 meses
-        {
-            "Fecha": "2026-10-01", "Producto": "Exprimidor Cítricos Inalámbrico USB-C",
-            "Categoria": "Cocina y Mini-Electro", "Ciudad_Destino": "Bogotá", "Tipo_Transporte": "Marítimo",
-            "EAN_UPC": "", "Partida_Arancelaria": "8509.40.10.00",
-            "TRM_COP": 4210.0, "Precio_FOB_USD": 6.90, "Flete_Unitario_USD": 0.95, "Arancel_Pct": 0.10,
-            "Precio_Venta_Mercado_COP": 98000, "Unidades_Importadas": 220, "Unidades_Vendidas": 195,
-        },
-        {
-            "Fecha": "2026-11-01", "Producto": "Exprimidor Cítricos Inalámbrico USB-C",
-            "Categoria": "Cocina y Mini-Electro", "Ciudad_Destino": "Barranquilla", "Tipo_Transporte": "Marítimo",
-            "EAN_UPC": "", "Partida_Arancelaria": "8509.40.10.00",
-            "TRM_COP": 4240.0, "Precio_FOB_USD": 6.90, "Flete_Unitario_USD": 0.90, "Arancel_Pct": 0.10,
-            "Precio_Venta_Mercado_COP": 96000, "Unidades_Importadas": 180, "Unidades_Vendidas": 162,
-        },
-        # 5) Producto 100% nuevo sin referencia en base (sin EAN y sin Partida) - 2 meses
-        {
-            "Fecha": "2026-10-01", "Producto": "Cafetera Cold Brew Acero Inoxidable 1L",
-            "Categoria": "Cocina y Mini-Electro", "Ciudad_Destino": "Bogotá", "Tipo_Transporte": "Marítimo",
-            "EAN_UPC": "", "Partida_Arancelaria": "",
-            "TRM_COP": 4210.0, "Precio_FOB_USD": 10.40, "Flete_Unitario_USD": 1.30, "Arancel_Pct": 0.10,
-            "Precio_Venta_Mercado_COP": 159000, "Unidades_Importadas": 200, "Unidades_Vendidas": 186,
-        },
-        {
-            "Fecha": "2026-11-01", "Producto": "Cafetera Cold Brew Acero Inoxidable 1L",
-            "Categoria": "Cocina y Mini-Electro", "Ciudad_Destino": "Medellín", "Tipo_Transporte": "Marítimo",
-            "EAN_UPC": "", "Partida_Arancelaria": "",
-            "TRM_COP": 4240.0, "Precio_FOB_USD": 10.40, "Flete_Unitario_USD": 1.30, "Arancel_Pct": 0.10,
-            "Precio_Venta_Mercado_COP": 162000, "Unidades_Importadas": 160, "Unidades_Vendidas": 149,
-        },
-    ]
-    return pd.DataFrame(filas)
-
-
-def preparar_archivo_externo(df_raw: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
-    """
-    Valida y normaliza un archivo Excel (.xlsx/.xls) o CSV cargado por una empresa:
-      - Acepta SKUs propios de la empresa sin exigir prefijo 'SR-'
-      - Si no existe la columna SKU o trae celdas vacías, autogenera SKUs determinísticos
-        por producto usando pd.factorize (ej. CLI-BEL-001)
-      - Calcula automáticamente Anio, Mes y Costo_Aterrizado_COP si el archivo los omite
-      - Limpia EAN_UPC y Partida_Arancelaria si están presentes
-    """
-    df_ext = df_raw.copy()
-    df_ext.columns = [str(c).strip() for c in df_ext.columns]
-
-    faltantes = [c for c in COLUMNAS_MINIMAS_EXTERNO if c not in df_ext.columns]
-    if faltantes:
-        raise ValueError(f"Faltan columnas obligatorias: {', '.join(faltantes)}")
-
-    # Parseo de fecha, año y mes
-    fechas = pd.to_datetime(df_ext["Fecha"], errors="coerce")
-    if fechas.isna().any():
-        raise ValueError("Algunas filas tienen valores inválidos en la columna 'Fecha' (usa formato YYYY-MM-DD).")
-    df_ext["Fecha"] = fechas.dt.strftime("%Y-%m-%d")
-    if "Anio" not in df_ext.columns or df_ext["Anio"].isna().any():
-        df_ext["Anio"] = fechas.dt.year.astype(int)
-    else:
-        df_ext["Anio"] = pd.to_numeric(df_ext["Anio"], errors="coerce").fillna(fechas.dt.year).astype(int)
-    if "Mes" not in df_ext.columns or df_ext["Mes"].isna().any():
-        df_ext["Mes"] = fechas.dt.month.astype(int)
-    else:
-        df_ext["Mes"] = pd.to_numeric(df_ext["Mes"], errors="coerce").fillna(fechas.dt.month).astype(int)
-
-    # Limpieza de textos principales
-    df_ext["Producto"] = df_ext["Producto"].astype(str).str.strip()
-    df_ext["Categoria"] = df_ext["Categoria"].astype(str).str.strip()
-    df_ext["Ciudad_Destino"] = df_ext["Ciudad_Destino"].astype(str).str.strip()
-    df_ext["Tipo_Transporte"] = df_ext["Tipo_Transporte"].astype(str).str.strip()
-
-    # Columnas numéricas principales
-    for col_num in [
-        "TRM_COP", "Precio_FOB_USD", "Flete_Unitario_USD", "Arancel_Pct",
-        "Precio_Venta_Mercado_COP", "Unidades_Importadas", "Unidades_Vendidas",
-    ]:
-        df_ext[col_num] = pd.to_numeric(df_ext[col_num], errors="coerce")
-        if df_ext[col_num].isna().any():
-            raise ValueError(f"Hay valores no numéricos o vacíos en la columna '{col_num}'.")
-
-    # Si el usuario escribió arancel como porcentaje entero (ej. 15 en vez de 0.15), normalizar
-    df_ext["Arancel_Pct"] = np.where(df_ext["Arancel_Pct"] > 1.0, df_ext["Arancel_Pct"] / 100.0, df_ext["Arancel_Pct"])
-
-    # IVA por defecto 19%
-    if "IVA_Pct" not in df_ext.columns:
-        df_ext["IVA_Pct"] = 0.19
-    else:
-        df_ext["IVA_Pct"] = pd.to_numeric(df_ext["IVA_Pct"], errors="coerce").fillna(0.19)
-        df_ext["IVA_Pct"] = np.where(df_ext["IVA_Pct"] > 1.0, df_ext["IVA_Pct"] / 100.0, df_ext["IVA_Pct"])
-
-    # Identificadores opcionales universales
-    if "EAN_UPC" not in df_ext.columns:
-        df_ext["EAN_UPC"] = ""
-    else:
-        df_ext["EAN_UPC"] = df_ext["EAN_UPC"].apply(limpiar_codigo_texto)
-
-    if "Partida_Arancelaria" not in df_ext.columns:
-        df_ext["Partida_Arancelaria"] = ""
-    else:
-        df_ext["Partida_Arancelaria"] = df_ext["Partida_Arancelaria"].apply(limpiar_codigo_texto)
-
-    # Puerto y tránsito si faltan
-    if "Puerto_Entrada" not in df_ext.columns or df_ext["Puerto_Entrada"].isna().any():
-        puertos_auto = np.where(
-            df_ext["Tipo_Transporte"].str.lower().str.contains("aér|aer"),
-            "Aéreo El Dorado",
-            np.where(df_ext["Ciudad_Destino"].isin(["Bogotá", "Cali", "Pereira"]), "Buenaventura", "Cartagena"),
-        )
-        if "Puerto_Entrada" not in df_ext.columns:
-            df_ext["Puerto_Entrada"] = puertos_auto
-        else:
-            df_ext["Puerto_Entrada"] = df_ext["Puerto_Entrada"].fillna(pd.Series(puertos_auto, index=df_ext.index))
-
-    if "Tiempo_Transito_Dias" not in df_ext.columns or df_ext["Tiempo_Transito_Dias"].isna().any():
-        transito_auto = np.where(df_ext["Tipo_Transporte"].str.lower().str.contains("aér|aer"), 11, 46)
-        if "Tiempo_Transito_Dias" not in df_ext.columns:
-            df_ext["Tiempo_Transito_Dias"] = transito_auto
-        else:
-            df_ext["Tiempo_Transito_Dias"] = pd.to_numeric(df_ext["Tiempo_Transito_Dias"], errors="coerce").fillna(
-                pd.Series(transito_auto, index=df_ext.index)
-            )
-    df_ext["Tiempo_Transito_Dias"] = df_ext["Tiempo_Transito_Dias"].astype(int)
-
-    # Costo aterrizado automático con fórmula aduanera de Colombia si falta o viene vacío
-    costos_calculados_auto = False
-    cif_usd = df_ext["Precio_FOB_USD"] + df_ext["Flete_Unitario_USD"]
-    arancel_usd = cif_usd * df_ext["Arancel_Pct"]
-    iva_usd = (cif_usd + arancel_usd) * df_ext["IVA_Pct"]
-    gastos_nac_usd = cif_usd * 0.08
-    costo_auto = (np.round(((cif_usd + arancel_usd + iva_usd + gastos_nac_usd) * df_ext["TRM_COP"]) / 100.0) * 100).astype(int)
-
-    if "Costo_Aterrizado_COP" not in df_ext.columns:
-        df_ext["Costo_Aterrizado_COP"] = costo_auto
-        costos_calculados_auto = True
-    else:
-        serie_costo = pd.to_numeric(df_ext["Costo_Aterrizado_COP"], errors="coerce")
-        mask_falta_costo = serie_costo.isna() | (serie_costo <= 0)
-        if mask_falta_costo.any():
-            costos_calculados_auto = True
-        df_ext["Costo_Aterrizado_COP"] = np.where(mask_falta_costo, costo_auto, serie_costo).astype(int)
-
-    # Defaults razonables para métricas complementarias si faltan
-    if "Competidores_Activos" not in df_ext.columns:
-        df_ext["Competidores_Activos"] = 25
-    else:
-        df_ext["Competidores_Activos"] = pd.to_numeric(df_ext["Competidores_Activos"], errors="coerce").fillna(25).astype(int)
-
-    if "Calificacion_Mercado" not in df_ext.columns:
-        df_ext["Calificacion_Mercado"] = 4.5
-    else:
-        df_ext["Calificacion_Mercado"] = pd.to_numeric(df_ext["Calificacion_Mercado"], errors="coerce").fillna(4.5)
-
-    if "Tasa_Devolucion_Pct" not in df_ext.columns:
-        df_ext["Tasa_Devolucion_Pct"] = 2.5
-    else:
-        df_ext["Tasa_Devolucion_Pct"] = pd.to_numeric(df_ext["Tasa_Devolucion_Pct"], errors="coerce").fillna(2.5)
-
-    df_ext["Unidades_Importadas"] = df_ext["Unidades_Importadas"].astype(int)
-    df_ext["Unidades_Vendidas"] = df_ext["Unidades_Vendidas"].astype(int)
-    df_ext["Precio_Venta_Mercado_COP"] = df_ext["Precio_Venta_Mercado_COP"].astype(int)
-
-    # ------------------------------------------------------------------
-    # MANEJO INTELIGENTE DE SKU (propios vs. autogenerados con pd.factorize)
-    # ------------------------------------------------------------------
-    if "SKU" not in df_ext.columns:
-        skus_raw = pd.Series([""] * len(df_ext), index=df_ext.index)
-    else:
-        skus_raw = df_ext["SKU"].apply(limpiar_codigo_texto).str.upper()
-
-    mask_sin_sku = skus_raw == ""
-    origen_sku_fila = np.where(mask_sin_sku, "Autogenerado (pd.factorize)", "Propio de la empresa")
-
-    skus_finales = skus_raw.copy()
-    if mask_sin_sku.any():
-        # Factorize determinístico por nombre normalizado de producto: mismo producto => mismo SKU en todos los meses
-        llaves_norm = df_ext.loc[mask_sin_sku, "Producto"].apply(normalizar_texto)
-        codigos_num, _ = pd.factorize(llaves_norm, sort=False)
-        prefijos_cat = (
-            df_ext.loc[mask_sin_sku, "Categoria"]
-            .apply(lambda c: re.sub(r"[^a-z]", "", normalizar_texto(c))[:3].upper().ljust(3, "X"))
-        )
-        skus_generados = [
-            f"CLI-{pref}-{num + 1:03d}"
-            for pref, num in zip(prefijos_cat, codigos_num)
-        ]
-        skus_finales.loc[mask_sin_sku] = skus_generados
-
-    df_ext["SKU"] = skus_finales
-    df_ext["_Origen_SKU"] = origen_sku_fila
-
-    skus_propios = int(df_ext.loc[~mask_sin_sku, "SKU"].nunique())
-    skus_auto = int(df_ext.loc[mask_sin_sku, "SKU"].nunique())
-
-    if skus_auto == 0:
-        etiqueta_origen = "SKUs propios de la empresa"
-    elif skus_propios == 0:
-        etiqueta_origen = "Autogenerados con pd.factorize"
-    else:
-        etiqueta_origen = "Mixto (propios + autogenerados)"
-
-    resumen = {
-        "total_filas": len(df_ext),
-        "skus_propios": skus_propios,
-        "skus_autogenerados": skus_auto,
-        "origen_sku": etiqueta_origen,
-        "costos_calculados_auto": costos_calculados_auto,
-        "mapa_skus": (
-            df_ext[["SKU", "Producto", "Categoria", "_Origen_SKU", "EAN_UPC", "Partida_Arancelaria"]]
-            .drop_duplicates(subset=["SKU"])
-            .reset_index(drop=True)
-        ),
-    }
-    return df_ext[COLUMNAS_MAESTRAS + ["_Origen_SKU"]], resumen
+    return pd.read_csv(ruta)
 
 
 def enriquecer_dataframe(df: pd.DataFrame) -> pd.DataFrame:
@@ -637,153 +259,6 @@ def calcular_radar_productos(df_filtrado: pd.DataFrame) -> pd.DataFrame:
     return resumen.sort_values("Indice_Oportunidad", ascending=False).reset_index(drop=True)
 
 
-def cruzar_contra_mercado(df_empresa_raw: pd.DataFrame, df_mercado_raw: pd.DataFrame) -> pd.DataFrame:
-    """
-    Cruza los productos cargados por una empresa contra la base de mercado SinoRadar
-    en 3 niveles de prioridad sin depender del SKU interno de la empresa:
-      1) Código de barras universal (EAN_UPC) -> cruce 1-a-1 exacto
-      2) Partida Arancelaria DIAN -> referencia contra el grupo aduanero
-      3) Similitud de texto sobre Producto + Categoría (difflib.SequenceMatcher)
-    """
-    df_emp = enriquecer_dataframe(df_empresa_raw)
-    df_mkt = enriquecer_dataframe(df_mercado_raw)
-    radar_mkt = calcular_radar_productos(df_mkt)
-
-    # Anexar EAN_UPC y Partida_Arancelaria al radar de mercado
-    ids_mkt = (
-        df_mkt[["SKU", "EAN_UPC", "Partida_Arancelaria"]]
-        .drop_duplicates(subset=["SKU"])
-    )
-    radar_mkt = radar_mkt.merge(ids_mkt, on="SKU", how="left")
-    radar_mkt["Nombre_Norm"] = radar_mkt["Producto"].apply(normalizar_texto)
-    radar_mkt["Cat_Norm"] = radar_mkt["Categoria"].apply(normalizar_texto)
-
-    # Promedios de mercado por Partida Arancelaria DIAN
-    partidas_mkt = (
-        radar_mkt[radar_mkt["Partida_Arancelaria"] != ""]
-        .groupby("Partida_Arancelaria", as_index=False)
-        .agg(
-            Precio_Mercado_Prom=("Precio_Venta_Prom", "mean"),
-            Margen_Mercado_Prom=("Margen_Bruto_Pct", "mean"),
-            Rotacion_Mercado_Prom=("Tasa_Rotacion_Pct", "mean"),
-            Competidores_Mercado=("Competidores_Prom", "mean"),
-            Cantidad_SKUs=("SKU", "count"),
-            Categoria_Ref=("Categoria", "first"),
-        )
-    )
-    mapa_partidas = partidas_mkt.set_index("Partida_Arancelaria").to_dict(orient="index")
-    mapa_ean_mkt = (
-        radar_mkt[radar_mkt["EAN_UPC"] != ""]
-        .drop_duplicates(subset=["EAN_UPC"])
-        .set_index("EAN_UPC")
-    )
-
-    # Agrupar productos de la empresa
-    emp_grp = (
-        df_emp.groupby(["SKU", "Producto", "Categoria"], as_index=False)
-        .agg(
-            Origen_SKU=("_Origen_SKU", "first"),
-            EAN_UPC=("EAN_UPC", lambda s: next((x for x in s if x), "")),
-            Partida_Arancelaria=("Partida_Arancelaria", lambda s: next((x for x in s if x), "")),
-            Filas=("Fecha", "count"),
-            Tu_Costo_COP=("Costo_Aterrizado_COP", "mean"),
-            Tu_Precio_COP=("Precio_Venta_Mercado_COP", "mean"),
-            Tu_Margen_Pct=("Margen_Bruto_Pct", "mean"),
-            Unidades_Imp=("Unidades_Importadas", "sum"),
-            Unidades_Ven=("Unidades_Vendidas", "sum"),
-        )
-    )
-    emp_grp["Tu_Rotacion_Pct"] = np.where(
-        emp_grp["Unidades_Imp"] > 0,
-        (emp_grp["Unidades_Ven"] / emp_grp["Unidades_Imp"]) * 100.0,
-        0.0,
-    )
-
-    resultados = []
-    for _, row in emp_grp.iterrows():
-        ean = limpiar_codigo_texto(row["EAN_UPC"])
-        partida = limpiar_codigo_texto(row["Partida_Arancelaria"])
-        nom_norm = normalizar_texto(row["Producto"])
-        cat_norm = normalizar_texto(row["Categoria"])
-
-        metodo = "🆕 Sin referencia directa (nicho propio)"
-        ref_txt = "No existe en catálogo base"
-        precio_mkt = np.nan
-        margen_mkt = np.nan
-        rot_mkt = np.nan
-        sem_mkt = "Evaluado por métricas propias"
-
-        # NIVEL 1: Cruce exacto por EAN / UPC
-        if ean and ean in mapa_ean_mkt.index:
-            m = mapa_ean_mkt.loc[ean]
-            metodo = "🏷️ Código de Barras (EAN/UPC)"
-            ref_txt = f"{m['SKU']} — {m['Producto']}"
-            precio_mkt = float(m["Precio_Venta_Prom"])
-            margen_mkt = float(m["Margen_Bruto_Pct"])
-            rot_mkt = float(m["Tasa_Rotacion_Pct"])
-            sem_mkt = str(m["Semaforo_Riesgo"])
-        else:
-            # Buscar mejor coincidencia por similitud de nombre (SequenceMatcher)
-            mejor_sim = 0.0
-            mejor_fila = None
-            candidatos = radar_mkt[radar_mkt["Cat_Norm"] == cat_norm]
-            if candidatos.empty:
-                candidatos = radar_mkt
-            for _, cand in candidatos.iterrows():
-                tokens_emp = set(nom_norm.split())
-                tokens_cand = set(cand["Nombre_Norm"].split())
-                sim_seq = SequenceMatcher(None, nom_norm, cand["Nombre_Norm"]).ratio()
-                sim_jac = len(tokens_emp & tokens_cand) / max(1, len(tokens_emp | tokens_cand))
-                sim_total = 0.60 * sim_seq + 0.40 * sim_jac
-                if sim_total > mejor_sim:
-                    mejor_sim = sim_total
-                    mejor_fila = cand
-
-            # NIVEL 2: Similitud alta de nombre (producto equivalente)
-            if mejor_fila is not None and mejor_sim >= 0.52:
-                metodo = f"🔤 Similitud de Nombre ({mejor_sim * 100:.0f}%)"
-                ref_txt = f"{mejor_fila['SKU']} — {mejor_fila['Producto']}"
-                precio_mkt = float(mejor_fila["Precio_Venta_Prom"])
-                margen_mkt = float(mejor_fila["Margen_Bruto_Pct"])
-                rot_mkt = float(mejor_fila["Tasa_Rotacion_Pct"])
-                sem_mkt = str(mejor_fila["Semaforo_Riesgo"])
-            # NIVEL 3: Cruce por Partida Arancelaria DIAN (grupo aduanero)
-            elif partida and partida in mapa_partidas:
-                mp = mapa_partidas[partida]
-                metodo = f"🛃 Partida DIAN ({partida})"
-                ref_txt = f"Familia {mp['Categoria_Ref']} ({mp['Cantidad_SKUs']} SKUs)"
-                precio_mkt = float(mp["Precio_Mercado_Prom"])
-                margen_mkt = float(mp["Margen_Mercado_Prom"])
-                rot_mkt = float(mp["Rotacion_Mercado_Prom"])
-                sem_mkt = "Referencia promedio DIAN"
-
-        dif_precio_pct = (
-            ((row["Tu_Precio_COP"] - precio_mkt) / precio_mkt) * 100.0
-            if pd.notna(precio_mkt) and precio_mkt > 0
-            else np.nan
-        )
-
-        resultados.append({
-            "SKU_Asignado": row["SKU"],
-            "Origen_SKU": row["Origen_SKU"],
-            "Producto_Empresa": row["Producto"],
-            "Categoria": row["Categoria"],
-            "Filas": int(row["Filas"]),
-            "Metodo_Cruce": metodo,
-            "Referencia_Mercado": ref_txt,
-            "Tu_Costo_COP": round(float(row["Tu_Costo_COP"]), 0),
-            "Tu_Precio_COP": round(float(row["Tu_Precio_COP"]), 0),
-            "Precio_Mercado_COP": round(precio_mkt, 0) if pd.notna(precio_mkt) else np.nan,
-            "Dif_Precio_Pct": round(dif_precio_pct, 1) if pd.notna(dif_precio_pct) else np.nan,
-            "Tu_Margen_Pct": round(float(row["Tu_Margen_Pct"]), 1),
-            "Margen_Mercado_Pct": round(margen_mkt, 1) if pd.notna(margen_mkt) else np.nan,
-            "Tu_Rotacion_Pct": round(float(row["Tu_Rotacion_Pct"]), 1),
-            "Semaforo_Mercado": sem_mkt,
-        })
-
-    return pd.DataFrame(resultados)
-
-
 def formato_cop(valor: float) -> str:
     if abs(valor) >= 1e9:
         return f"${valor / 1e9:,.2f}B COP"
@@ -796,104 +271,56 @@ def formato_cop(valor: float) -> str:
 # 3. CARGA, FUSIÓN DE DATOS (PD.CONCAT) Y FILTROS LATERALES
 # ==============================================================================
 df_raw_base = cargar_csv_base()
-df_empresa_cargada = None
-resumen_carga_ext = None
-cruce_mercado_df = None
 
 with st.sidebar:
     st.markdown("## 🚢 SinoRadar Colombia")
     st.caption("Inteligencia Comercial China → Colombia")
     st.divider()
 
-    st.markdown("### 📂 Cargar Excel / CSV de Empresa")
+    st.markdown("### 📂 Expansión de Base de Datos")
     modo_carga = st.radio(
-        "Modo al cargar archivo externo:",
+        "Modo al subir archivo CSV:",
         options=["Sumar a la base actual (pd.concat)", "Reemplazar toda la base"],
         index=0,
     )
     archivo_subido = st.file_uploader(
-        "Subir Excel (.xlsx / .xls) o CSV",
-        type=["xlsx", "xls", "csv"],
-        help="Acepta tus SKUs propios o genera SKUs automáticos (pd.factorize) si tu Excel no tiene columna SKU.",
+        "Subir CSV adicional o propio",
+        type=["csv"],
+        help="Sube registros adicionales para ampliar el análisis en tiempo real.",
     )
 
     df_combinado_raw = df_raw_base.copy()
-
-    # Prioridad: archivo real subido por el usuario; si no hay archivo, revisar si activó el Excel demo sin SKU
     if archivo_subido is not None:
-        st.session_state["usar_demo_excel_sin_sku"] = False
         try:
-            nombre_arch = archivo_subido.name.lower()
-            if nombre_arch.endswith((".xlsx", ".xls")):
-                df_leido = pd.read_excel(archivo_subido, dtype={"EAN_UPC": str, "Partida_Arancelaria": str, "SKU": str})
+            df_extra_csv = pd.read_csv(archivo_subido)
+            faltantes = [c for c in COLUMNAS_REQUERIDAS if c not in df_extra_csv.columns]
+            if faltantes:
+                st.error(f"Faltan columnas: {', '.join(faltantes)}")
             else:
-                df_leido = pd.read_csv(archivo_subido, dtype={"EAN_UPC": str, "Partida_Arancelaria": str, "SKU": str})
-
-            df_empresa_cargada, resumen_carga_ext = preparar_archivo_externo(df_leido)
-            cruce_mercado_df = cruzar_contra_mercado(df_empresa_cargada, df_raw_base)
-
-            if modo_carga.startswith("Sumar"):
-                df_combinado_raw = pd.concat(
-                    [df_combinado_raw, df_empresa_cargada[COLUMNAS_MAESTRAS]],
-                    ignore_index=True,
-                )
-                st.success(f"+{resumen_carga_ext['total_filas']:,} filas sumadas desde `{archivo_subido.name}`.")
-            else:
-                df_combinado_raw = df_empresa_cargada[COLUMNAS_MAESTRAS].copy()
-                st.success(f"Base reemplazada: {len(df_combinado_raw):,} filas.")
-
-            if resumen_carga_ext["skus_autogenerados"] > 0:
-                st.info(
-                    f"SKU automático: **{resumen_carga_ext['skus_autogenerados']}** productos sin SKU "
-                    f"recibieron código único (`pd.factorize`). Ver pestaña **🔗 Carga Excel y Cruce SKU**."
-                )
+                if modo_carga.startswith("Sumar"):
+                    df_combinado_raw = pd.concat([df_combinado_raw, df_extra_csv[COLUMNAS_REQUERIDAS]], ignore_index=True)
+                    st.success(f"+{len(df_extra_csv):,} filas añadidas.")
+                else:
+                    df_combinado_raw = df_extra_csv[COLUMNAS_REQUERIDAS].copy()
+                    st.success(f"Base reemplazada: {len(df_combinado_raw):,} filas.")
         except Exception as exc:
-            st.error(f"Error leyendo el archivo: {exc}")
-
-    elif st.session_state["usar_demo_excel_sin_sku"]:
-        df_demo_raw = crear_dataset_demo_empresa_sin_sku(df_raw_base)
-        df_empresa_cargada, resumen_carga_ext = preparar_archivo_externo(df_demo_raw)
-        cruce_mercado_df = cruzar_contra_mercado(df_empresa_cargada, df_raw_base)
-
-        if modo_carga.startswith("Sumar"):
-            df_combinado_raw = pd.concat(
-                [df_combinado_raw, df_empresa_cargada[COLUMNAS_MAESTRAS]],
-                ignore_index=True,
-            )
-        else:
-            df_combinado_raw = df_empresa_cargada[COLUMNAS_MAESTRAS].copy()
-
-        st.success("🧪 Modo prueba activo: Excel de empresa (10 filas, sin columna SKU).")
-        if st.button("✖️ Quitar Excel de prueba", use_container_width=True):
-            st.session_state["usar_demo_excel_sin_sku"] = False
-            st.rerun()
+            st.error(f"Error leyendo el CSV: {exc}")
 
     # Combinar registros añadidos manualmente en el formulario de la pestaña "➕ Agregar Datos"
     if st.session_state["registros_manuales"]:
         df_manual = pd.DataFrame(st.session_state["registros_manuales"])
-        df_combinado_raw = pd.concat([df_combinado_raw, df_manual[COLUMNAS_MAESTRAS]], ignore_index=True)
+        df_combinado_raw = pd.concat([df_combinado_raw, df_manual[COLUMNAS_REQUERIDAS]], ignore_index=True)
         st.info(f"Registros añadidos en vivo: **+{len(df_manual)}**")
 
     df_base = enriquecer_dataframe(df_combinado_raw)
 
-    # Descarga de plantillas en Excel (.xlsx) para pruebas reales
-    plantilla_xlsx = generar_excel_bytes(df_raw_base.head(3)[COLUMNAS_MAESTRAS], nombre_hoja="Plantilla_SinoRadar")
+    # Plantilla vacía/ejemplo para que cualquier usuario pueda crear su CSV
+    plantilla_csv = df_raw_base.head(3).to_csv(index=False).encode("utf-8-sig")
     st.download_button(
-        "📗 Plantilla Excel completa (.xlsx)",
-        data=plantilla_xlsx,
-        file_name="plantilla_completa_sinoradar.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-    )
-    demo_sin_sku_xlsx = generar_excel_bytes(
-        crear_dataset_demo_empresa_sin_sku(df_raw_base),
-        nombre_hoja="Productos_Empresa_Sin_SKU",
-    )
-    st.download_button(
-        "🧪 Excel de prueba SIN SKU (.xlsx)",
-        data=demo_sin_sku_xlsx,
-        file_name="ejemplo_empresa_sin_sku.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "📄 Descargar plantilla CSV (3 filas ejemplo)",
+        data=plantilla_csv,
+        file_name="plantilla_importaciones_sinoradar.csv",
+        mime="text/csv",
         use_container_width=True,
     )
 
@@ -914,8 +341,6 @@ with st.sidebar:
 
     fob_min = float(df_base["Precio_FOB_USD"].min())
     fob_max = float(df_base["Precio_FOB_USD"].max())
-    if fob_max <= fob_min:
-        fob_max = fob_min + 1.0
     rango_fob = st.slider(
         "Rango Precio FOB en China (USD)",
         min_value=fob_min,
@@ -966,13 +391,12 @@ radar_df = calcular_radar_productos(df)
 # ==============================================================================
 # 4. NAVEGACIÓN POR PESTAÑAS COMERCIALES
 # ==============================================================================
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "📊 Radar Ejecutivo",
     "🚦 Semáforo de Inventario",
     "🧮 Simulador de Importación",
     "📈 Estacionalidad y Pronóstico",
     "🔎 Datos y Correlaciones",
-    "🔗 Carga Excel y Cruce SKU",
     "➕ Agregar Datos en Vivo",
     "ℹ️ Metodología y Equipo",
 ])
@@ -1059,7 +483,7 @@ with tab1:
         )
         fig_cat.update_traces(textposition="outside")
         fig_cat.update_layout(
-            title=f"Ventas y Margen por Categoría ({len(cat_resumen)} Rubros)",
+            title="Ventas y Margen por Categoría (10 Rubros)",
             plot_bgcolor="#FFFFFF",
             paper_bgcolor="#FFFFFF",
             margin=dict(l=10, r=55, t=40, b=10),
@@ -1070,15 +494,9 @@ with tab1:
     st.markdown("### 🏆 Ranking Comercial de Productos Importados")
     col_rk1, col_rk2 = st.columns([2, 1])
     with col_rk1:
-        buscar_rk = st.text_input("Filtrar ranking por producto o SKU:", placeholder="Ej: Proyector, Cafetera, SR-TEC, CLI-...")
+        buscar_rk = st.text_input("Filtrar ranking por producto o SKU:", placeholder="Ej: Proyector, Cafetera, SR-TEC...")
     with col_rk2:
-        opciones_top = [n for n in [15, 30, 50] if n < len(radar_df)] + [len(radar_df)]
-        top_n = st.selectbox(
-            "Cantidad a mostrar:",
-            options=opciones_top,
-            index=0,
-            format_func=lambda n: f"Todos ({n})" if n == len(radar_df) else f"Top {n}",
-        )
+        top_n = st.selectbox("Cantidad a mostrar:", options=[15, 30, 50, len(radar_df)], index=0, format_func=lambda n: f"Todos ({n})" if n == len(radar_df) else f"Top {n}")
 
     ranking_vista = radar_df.copy()
     if buscar_rk.strip():
@@ -1093,7 +511,7 @@ with tab1:
         ranking_vista.head(top_n)[[
             "SKU", "Producto", "Categoria", "Indice_Oportunidad", "Semaforo_Riesgo",
             "Margen_Bruto_Pct", "Tasa_Rotacion_Pct", "Crecimiento_Mensual_Pct",
-            "Precio_FOB_Prom_USD", "Precio_Venta_Prom", "Competidores_Prom",
+            "Precio_FOB_Prom_USD", "Precio_Venta_Prom", "Competidores_Prom"
         ]],
         use_container_width=True,
         hide_index=True,
@@ -1220,7 +638,7 @@ with tab2:
         tabla_sem[[
             "SKU", "Producto", "Categoria", "Semaforo_Riesgo", "Indice_Oportunidad",
             "Tasa_Rotacion_Pct", "Inventario_Estancado", "Capital_Inmovilizado_COP",
-            "Competidores_Prom", "Accion_Recomendada",
+            "Competidores_Prom", "Accion_Recomendada"
         ]],
         use_container_width=True,
         hide_index=True,
@@ -1239,7 +657,7 @@ with tab2:
 with tab3:
     st.markdown("### 🧮 Simulador Comercial de Importación y Fijación de Precios")
     st.caption(
-        "Selecciona cualquiera de los productos de la base para precargar sus referencias del mercado colombiano "
+        "Selecciona cualquiera de los productos de la base para precargar sus referencias reales del mercado colombiano "
         "y simular tu inversión, punto de equilibrio y sensibilidad ante cambios de la TRM."
     )
 
@@ -1270,10 +688,10 @@ with tab3:
         unidades_lote = st.number_input("Cantidad a importar (MOQ unidades)", min_value=20, max_value=50000, value=300, step=20)
         fob_sim = st.number_input("Precio FOB negociado en China (USD)", min_value=0.5, max_value=1000.0, value=float(round(fila_prod["Precio_FOB_Prom_USD"], 2)), step=0.5)
         flete_sim = st.number_input("Flete internacional unitario (USD)", min_value=0.2, max_value=200.0, value=float(round(fila_prod["Flete_Prom_USD"], 2)), step=0.2)
-        trm_sim = st.slider("TRM proyectada (COP / USD)", min_value=3600, max_value=5000, value=int(np.clip(round(trm_actual_prom, -1), 3600, 5000)), step=20)
-        arancel_sim = st.slider("Arancel de importación (%)", min_value=0, max_value=25, value=int(np.clip(round(fila_prod["Arancel_Prom"] * 100), 0, 25)), step=1) / 100.0
+        trm_sim = st.slider("TRM proyectada (COP / USD)", min_value=3600, max_value=5000, value=int(round(trm_actual_prom, -1)), step=20)
+        arancel_sim = st.slider("Arancel de importación (%)", min_value=0, max_value=25, value=int(round(fila_prod["Arancel_Prom"] * 100)), step=1) / 100.0
         gastos_nac_sim = st.slider("Nacionalización y logística local (% sobre CIF)", min_value=3, max_value=20, value=8, step=1) / 100.0
-        tasa_venta_esp = st.slider("Rotación esperada del lote (%)", min_value=50, max_value=100, value=int(np.clip(round(fila_prod["Tasa_Rotacion_Pct"]), 50, 98)), step=1) / 100.0
+        tasa_venta_esp = st.slider("Rotación esperada del lote (%)", min_value=50, max_value=100, value=int(round(min(98, fila_prod["Tasa_Rotacion_Pct"]))), step=1) / 100.0
 
         precio_sugerido = int(round(p50_mercado / 500.0) * 500)
         precio_venta_sim = st.number_input(
@@ -1426,8 +844,6 @@ with tab4:
             """,
             unsafe_allow_html=True,
         )
-    else:
-        st.info("Se necesitan al menos 2 meses distintos en los datos filtrados para calcular la tendencia lineal (`np.polyfit`).")
 
     col_e1, col_e2 = st.columns(2)
     with col_e1:
@@ -1458,7 +874,7 @@ with tab4:
             color="Margen_Prom",
             color_continuous_scale="Blues",
             text=ciudad_res["Ingresos_COP"].apply(formato_cop),
-            title=f"Demanda Regional en Colombia ({len(ciudad_res)} Ciudades)",
+            title="Demanda Regional en Colombia (5 Ciudades)",
             labels={"Ciudad_Destino": "Ciudad", "Ingresos_COP": "Ingresos (COP)", "Margen_Prom": "Margen %"},
             height=360,
         )
@@ -1477,7 +893,7 @@ with tab5:
         cols_corr = [
             "Precio_FOB_USD", "Costo_Aterrizado_COP", "Precio_Venta_Mercado_COP",
             "Margen_Bruto_Pct", "Unidades_Vendidas", "Tasa_Rotacion_Pct",
-            "Competidores_Activos", "Tasa_Devolucion_Pct",
+            "Competidores_Activos", "Tasa_Devolucion_Pct"
         ]
         corr_matrix = df[cols_corr].corr(numeric_only=True)
         fig_corr = px.imshow(
@@ -1497,225 +913,58 @@ with tab5:
         desc = df[[
             "TRM_COP", "Precio_FOB_USD", "Costo_Aterrizado_COP",
             "Precio_Venta_Mercado_COP", "Margen_Bruto_Pct",
-            "Unidades_Vendidas", "Tasa_Rotacion_Pct", "Competidores_Activos",
+            "Unidades_Vendidas", "Tasa_Rotacion_Pct", "Competidores_Activos"
         ]].describe().T[["mean", "std", "min", "50%", "max"]]
         desc.columns = ["Promedio", "Desv. Est.", "Mínimo", "Mediana", "Máximo"]
         st.dataframe(desc.style.format("{:,.2f}"), use_container_width=True, height=370)
 
     st.markdown("#### Buscador de Registros Históricos")
-    busqueda = st.text_input(
-        "Buscar por producto, SKU, código de barras (EAN), partida DIAN, ciudad o puerto:",
-        placeholder="Ej: Cafetera, SR-GAM-01, 6901234000252, 8543.70.90.00, Bucaramanga...",
-    )
+    busqueda = st.text_input("Buscar por nombre de producto, SKU, ciudad o puerto:", placeholder="Ej: Cafetera, SR-GAM-01, Bucaramanga...")
     df_tabla = df.copy()
     if busqueda.strip():
         q = busqueda.strip().lower()
         df_tabla = df_tabla[
             df_tabla["Producto"].str.lower().str.contains(q)
             | df_tabla["SKU"].str.lower().str.contains(q)
-            | df_tabla["EAN_UPC"].astype(str).str.lower().str.contains(q)
-            | df_tabla["Partida_Arancelaria"].astype(str).str.lower().str.contains(q)
             | df_tabla["Ciudad_Destino"].str.lower().str.contains(q)
             | df_tabla["Puerto_Entrada"].str.lower().str.contains(q)
         ]
 
     st.dataframe(
         df_tabla[[
-            "Fecha", "SKU", "EAN_UPC", "Partida_Arancelaria", "Producto", "Categoria",
-            "Ciudad_Destino", "Tipo_Transporte", "Precio_FOB_USD", "Costo_Aterrizado_COP",
-            "Precio_Venta_Mercado_COP", "Unidades_Importadas", "Unidades_Vendidas",
-            "Tasa_Rotacion_Pct", "Margen_Bruto_Pct", "Competidores_Activos",
+            "Fecha", "SKU", "Producto", "Categoria", "Ciudad_Destino", "Tipo_Transporte",
+            "Precio_FOB_USD", "Costo_Aterrizado_COP", "Precio_Venta_Mercado_COP",
+            "Unidades_Importadas", "Unidades_Vendidas", "Tasa_Rotacion_Pct",
+            "Margen_Bruto_Pct", "Competidores_Activos"
         ]].head(500),
         use_container_width=True,
         hide_index=True,
     )
     st.caption(f"Mostrando hasta 500 de {len(df_tabla):,} registros filtrados.")
 
-    col_exp1, col_exp2 = st.columns(2)
-    with col_exp1:
-        csv_export = df_tabla.to_csv(index=False).encode("utf-8-sig")
-        st.download_button(
-            label="⬇️ Descargar registros filtrados (.csv)",
-            data=csv_export,
-            file_name="sinoradar_datos_filtrados.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
-    with col_exp2:
-        xlsx_export = generar_excel_bytes(df_tabla.head(5000), nombre_hoja="Datos_Filtrados")
-        st.download_button(
-            label="📗 Descargar registros filtrados en Excel (.xlsx)",
-            data=xlsx_export,
-            file_name="sinoradar_datos_filtrados.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
-
-# ------------------------------------------------------------------------------
-# TAB 6: CARGA EXCEL, GENERACIÓN AUTOMÁTICA DE SKU Y CRUCE CONTRA EL MERCADO
-# ------------------------------------------------------------------------------
-with tab6:
-    st.markdown("### 🔗 Carga de Excel Externo, Gestión Inteligente de SKU y Cruce con el Mercado")
-    st.caption(
-        "Módulo implementado para resolver cómo una empresa real sube su propio Excel (.xlsx/.csv) "
-        "aunque no tenga columna de SKU ni use los códigos internos de SinoRadar."
+    csv_export = df_tabla.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        label="⬇️ Descargar registros filtrados (.csv)",
+        data=csv_export,
+        file_name="sinoradar_datos_filtrados.csv",
+        mime="text/csv",
     )
 
-    col_exp_a, col_exp_b, col_exp_c = st.columns(3)
-    with col_exp_a:
-        st.markdown(
-            """
-            <div class="insight-card insight-green">
-                <b>1. Si tu Excel ya trae SKU propio</b><br>
-                <span style="font-size:0.89rem;">
-                    SinoRadar respeta directamente los códigos internos de tu empresa (ej. <code>EMP-001</code>) sin exigir prefijo <code>SR-</code>.
-                </span>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    with col_exp_b:
-        st.markdown(
-            """
-            <div class="insight-card">
-                <b>2. Si tu Excel viene SIN columna SKU</b><br>
-                <span style="font-size:0.89rem;">
-                    Python crea automáticamente códigos consistentes (<code>CLI-CAT-001</code>) con <code>pd.factorize()</code>: el mismo producto mantiene el mismo SKU en todos los meses.
-                </span>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    with col_exp_c:
-        st.markdown(
-            """
-            <div class="insight-card insight-amber">
-                <b>3. Cruce contra el mercado</b><br>
-                <span style="font-size:0.89rem;">
-                    Compara tus productos contra nuestra base usando <b>Código de Barras (EAN/UPC)</b>, <b>similitud de nombre</b> o <b>Partida Arancelaria DIAN</b>.
-                </span>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    if cruce_mercado_df is None or resumen_carga_ext is None:
-        st.markdown(
-            """
-            <div class="insight-card">
-                <b>¿Cómo probarlo en segundos?</b><br>
-                Puedes subir tu propio archivo <code>.xlsx</code> o <code>.csv</code> en la barra lateral izquierda,
-                descargar el <b>Excel de prueba SIN SKU</b> desde la barra lateral, o hacer clic en el botón de abajo
-                para cargar una empresa de demostración (5 productos × 2 meses, sin columna SKU ni costo aterrizado) y ver todo el cruce en vivo.
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        if st.button("▶️ Probar ahora con Excel de ejemplo (sin columna SKU)", type="primary", use_container_width=True):
-            st.session_state["usar_demo_excel_sin_sku"] = True
-            st.rerun()
-    else:
-        # KPIs del archivo cargado
-        k_e1, k_e2, k_e3, k_e4 = st.columns(4)
-        k_e1.metric("Filas cargadas", f"{resumen_carga_ext['total_filas']:,}", resumen_carga_ext["origen_sku"])
-        k_e2.metric("SKUs propios respetados", f"{resumen_carga_ext['skus_propios']}")
-        k_e3.metric("SKUs autogenerados", f"{resumen_carga_ext['skus_autogenerados']}", "vía pd.factorize")
-        emparejados = int((~cruce_mercado_df["Metodo_Cruce"].str.startswith("🆕")).sum())
-        k_e4.metric("Emparejados vs. Mercado", f"{emparejados} / {len(cruce_mercado_df)}", "EAN / Nombre / DIAN")
-
-        if resumen_carga_ext["costos_calculados_auto"]:
-            st.info(
-                "💡 El archivo cargado no traía `Costo_Aterrizado_COP` completo: SinoRadar lo calculó automáticamente "
-                "con la fórmula aduanera colombiana `(CIF + Arancel + IVA 19% + 8% Nac.) × TRM`."
-            )
-
-        st.markdown("#### 📋 Resultado del Cruce Automático: Tu Empresa vs. Mercado SinoRadar")
-        st.dataframe(
-            cruce_mercado_df,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "SKU_Asignado": st.column_config.TextColumn("SKU en Sistema"),
-                "Origen_SKU": st.column_config.TextColumn("Origen del SKU"),
-                "Producto_Empresa": st.column_config.TextColumn("Tu Producto"),
-                "Metodo_Cruce": st.column_config.TextColumn("Cómo se cruzó"),
-                "Referencia_Mercado": st.column_config.TextColumn("Referencia en SinoRadar"),
-                "Tu_Costo_COP": st.column_config.NumberColumn("Tu Costo", format="$%,.0f"),
-                "Tu_Precio_COP": st.column_config.NumberColumn("Tu Precio", format="$%,.0f"),
-                "Precio_Mercado_COP": st.column_config.NumberColumn("Precio Mercado", format="$%,.0f"),
-                "Dif_Precio_Pct": st.column_config.NumberColumn("Dif. Precio", format="%+.1f%%"),
-                "Tu_Margen_Pct": st.column_config.NumberColumn("Tu Margen", format="%.1f%%"),
-                "Margen_Mercado_Pct": st.column_config.NumberColumn("Margen Mercado", format="%.1f%%"),
-                "Tu_Rotacion_Pct": st.column_config.NumberColumn("Tu Rotación", format="%.1f%%"),
-            },
-        )
-
-        # Gráfico comparativo Tu Precio vs. Precio Mercado para productos emparejados
-        comp_plot = cruce_mercado_df.dropna(subset=["Precio_Mercado_COP"])
-        if not comp_plot.empty:
-            fig_comp = go.Figure()
-            fig_comp.add_trace(go.Bar(
-                name="Tu Precio de Venta (COP)",
-                x=comp_plot["Producto_Empresa"],
-                y=comp_plot["Tu_Precio_COP"],
-                marker_color="#1E3A8A",
-            ))
-            fig_comp.add_trace(go.Bar(
-                name="Precio Promedio Mercado SinoRadar (COP)",
-                x=comp_plot["Producto_Empresa"],
-                y=comp_plot["Precio_Mercado_COP"],
-                marker_color="#10B981",
-            ))
-            fig_comp.update_layout(
-                barmode="group",
-                title="Comparativa Directa: Tu Precio de Venta vs. Referencia del Mercado Colombiano",
-                xaxis_title="Producto de tu archivo",
-                yaxis_title="Precio (COP)",
-                plot_bgcolor="#FFFFFF",
-                paper_bgcolor="#FFFFFF",
-                height=360,
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            )
-            st.plotly_chart(fig_comp, use_container_width=True)
-
-        col_d1, col_d2 = st.columns(2)
-        with col_d1:
-            xlsx_con_sku = generar_excel_bytes(
-                df_empresa_cargada[COLUMNAS_MAESTRAS],
-                nombre_hoja="Empresa_Con_SKU_Asignado",
-            )
-            st.download_button(
-                "📗 Descargar tu archivo enriquecido con SKUs y costos (.xlsx)",
-                data=xlsx_con_sku,
-                file_name="empresa_enriquecida_con_sku_sinoradar.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
-        with col_d2:
-            xlsx_cruce = generar_excel_bytes(cruce_mercado_df, nombre_hoja="Cruce_vs_Mercado")
-            st.download_button(
-                "📊 Descargar reporte de cruce contra el mercado (.xlsx)",
-                data=xlsx_cruce,
-                file_name="reporte_cruce_mercado_sinoradar.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
-
 # ------------------------------------------------------------------------------
-# TAB 7: AGREGAR NUEVOS PRODUCTOS / IMPORTACIONES EN VIVO
+# TAB 6: AGREGAR NUEVOS PRODUCTOS / IMPORTACIONES EN VIVO
 # ------------------------------------------------------------------------------
-with tab7:
+with tab6:
     st.markdown("### ➕ Registrar Nuevos Productos e Importaciones en Vivo")
     st.caption(
-        "Añade nuevos productos o embarques directamente desde la web. Si dejas el SKU en blanco, "
-        "la plataforma crea uno automáticamente. El sistema calcula el costo aterrizado en Colombia "
-        "(CIF + Arancel + IVA 19% + Nacionalización × TRM), concatena con `pd.concat` y actualiza todo al instante."
+        "Añade nuevos productos o embarques directamente desde la web. El sistema calcula automáticamente "
+        "el costo aterrizado en Colombia (CIF + Arancel + IVA 19% + Nacionalización × TRM), concatena el registro "
+        "mediante `pd.concat` y actualiza al instante todos los gráficos y el Semáforo de Riesgo."
     )
 
     with st.form("form_nuevo_registro", clear_on_submit=True):
         f1, f2, f3 = st.columns(3)
         with f1:
-            nuevo_sku = st.text_input("SKU del producto (opcional — vacío = automático)", value="")
+            nuevo_sku = st.text_input("SKU del producto", value="SR-NEW-01")
             nuevo_prod = st.text_input("Nombre del producto", placeholder="Ej: Aspiradora Robot Láser LiDAR")
             nueva_cat = st.selectbox("Categoría", options=sorted(df_base["Categoria"].unique().tolist()) + ["Nueva Categoría"])
             if nueva_cat == "Nueva Categoría":
@@ -1723,7 +972,6 @@ with tab7:
             else:
                 nueva_cat_custom = nueva_cat
             nueva_ciudad = st.selectbox("Ciudad destino", options=["Bogotá", "Medellín", "Cali", "Barranquilla", "Bucaramanga", "Cartagena", "Pereira"])
-            nuevo_ean = st.text_input("Código de barras EAN/UPC (opcional)", placeholder="Ej: 6901234000252")
 
         with f2:
             nueva_fecha = st.date_input("Fecha del embarque / mes", value=datetime.date(2026, 11, 1))
@@ -1731,7 +979,6 @@ with tab7:
             nuevo_fob = st.number_input("Precio FOB en China (USD)", min_value=0.5, max_value=2000.0, value=14.5, step=0.5)
             nuevo_flete = st.number_input("Flete unitario (USD)", min_value=0.2, max_value=300.0, value=2.4, step=0.2)
             nuevo_arancel = st.slider("Arancel (%)", min_value=0, max_value=25, value=10, step=1) / 100.0
-            nueva_partida = st.text_input("Partida arancelaria DIAN (opcional)", placeholder="Ej: 8509.80.20.00")
 
         with f3:
             nueva_trm = st.number_input("TRM del mes (COP/USD)", min_value=3500.0, max_value=5500.0, value=4250.0, step=10.0)
@@ -1754,21 +1001,11 @@ with tab7:
                 puerto_auto = "Aéreo El Dorado" if nuevo_transp == "Aéreo" else ("Buenaventura" if nueva_ciudad in ["Bogotá", "Cali", "Pereira"] else "Cartagena")
                 transito_auto = 11 if nuevo_transp == "Aéreo" else 46
 
-                if nuevo_sku.strip():
-                    sku_final = nuevo_sku.strip().upper()
-                else:
-                    pref = re.sub(r"[^a-z]", "", normalizar_texto(nueva_cat_custom))[:3].upper().ljust(3, "X")
-                    sku_final = f"VIV-{pref}-{len(st.session_state['registros_manuales']) + 1:03d}"
-
-                partida_final = nueva_partida.strip() or PARTIDAS_DIAN_DEFAULT.get(nueva_cat_custom.strip(), "")
-
                 nuevo_reg = {
                     "Fecha": nueva_fecha.strftime("%Y-%m-01"),
                     "Anio": nueva_fecha.year,
                     "Mes": nueva_fecha.month,
-                    "SKU": sku_final,
-                    "EAN_UPC": limpiar_codigo_texto(nuevo_ean),
-                    "Partida_Arancelaria": partida_final,
+                    "SKU": nuevo_sku.strip().upper(),
                     "Producto": nuevo_prod.strip(),
                     "Categoria": nueva_cat_custom.strip(),
                     "Ciudad_Destino": nueva_ciudad,
@@ -1790,7 +1027,7 @@ with tab7:
                 }
                 st.session_state["registros_manuales"].append(nuevo_reg)
                 st.success(
-                    f"Registro agregado: **{nuevo_reg['Producto']}** (`{sku_final}`) | Costo aterrizado calculado: "
+                    f"Registro agregado: **{nuevo_reg['Producto']}** | Costo aterrizado calculado: "
                     f"**${costo_aterrizado:,.0f} COP**. Recargando métricas..."
                 )
                 st.rerun()
@@ -1800,34 +1037,25 @@ with tab7:
         df_ses = pd.DataFrame(st.session_state["registros_manuales"])
         st.dataframe(df_ses, use_container_width=True, hide_index=True)
 
-        col_act1, col_act2, col_act3 = st.columns(3)
+        col_act1, col_act2 = st.columns(2)
         with col_act1:
             csv_master = df_combinado_raw.to_csv(index=False).encode("utf-8-sig")
             st.download_button(
-                "💾 Base Maestra Actualizada (.csv)",
+                "💾 Descargar Base Maestra Actualizada (.csv)",
                 data=csv_master,
                 file_name="importaciones_china_colombia_actualizada.csv",
                 mime="text/csv",
                 use_container_width=True,
             )
         with col_act2:
-            xlsx_ses = generar_excel_bytes(df_ses, nombre_hoja="Registros_En_Vivo")
-            st.download_button(
-                "📗 Registros de sesión (.xlsx)",
-                data=xlsx_ses,
-                file_name="registros_en_vivo_sinoradar.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
-        with col_act3:
-            if st.button("🗑️ Limpiar registros de sesión", use_container_width=True):
+            if st.button("🗑️ Limpiar registros añadidos en sesión", use_container_width=True):
                 st.session_state["registros_manuales"] = []
                 st.rerun()
 
 # ------------------------------------------------------------------------------
-# TAB 8: METODOLOGÍA, ARQUITECTURA PYTHON Y EQUIPO
+# TAB 7: METODOLOGÍA, ARQUITECTURA PYTHON Y EQUIPO
 # ------------------------------------------------------------------------------
-with tab8:
+with tab7:
     st.markdown("### ℹ️ Arquitectura Técnica, Sustentación de Datos y Equipo")
 
     col_m1, col_m2 = st.columns(2)
@@ -1837,12 +1065,12 @@ with tab8:
             #### 1. Sustentación y Escalabilidad de la Base de Datos
             La base de datos inicial (`importaciones_china_colombia.csv`) contiene **14,400 registros estructurados**
             generados de forma reproducible mediante `generar_datos.py` (**120 productos reales** × 10 categorías ×
-            24 meses × 5 ciudades colombianas), incorporando **código de barras (`EAN_UPC`)** y **partida arancelaria DIAN**:
+            24 meses × 5 ciudades colombianas):
             - **Fórmula aduanera real en Colombia:**
               $$\text{CIF} = \text{FOB} + \text{Flete}$$
               $$\text{Costo Aterrizado} = \left(\text{CIF} + \text{Arancel} + \text{IVA}_{19\%} + \text{Nacionalización}\right) \times \text{TRM}$$
-            - **Gestión de archivos externos (Excel y CSV):** Respeta los SKUs propios de cada empresa o los crea automáticamente con `pd.factorize` si el Excel no trae esa columna, y cruza productos contra el mercado mediante **EAN/UPC**, **Partida DIAN** o **similitud de nombre**.
             - **Estacionalidad comercial:** Modela picos verificables en Colombia (Día de la Madre, prima de junio, Black Friday y Navidad).
+            - **Tres formas de crecer la base:** (1) Subir archivos `.csv` adicionales en la barra lateral para fusionarlos con `pd.concat`, (2) registrar embarques en vivo desde la pestaña *Agregar Datos*, o (3) ampliar el catálogo en `generar_datos.py`.
             """
         )
 
@@ -1850,9 +1078,13 @@ with tab8:
         st.markdown(
             """
             #### 2. Conceptos de Python, Pandas y NumPy Aplicados
-            - **Pandas + OpenPyXL:** Lectura y exportación nativa de Excel (`.xlsx`) y CSV, autogeneración determinística de SKU (`pd.factorize`), fusión dinámica (`pd.concat`), indexación booleana múltiple (`.isin()`, `.between()`), agregaciones (`groupby().agg()`), series de tiempo (`pd.to_datetime`) y matrices de correlación (`.corr()`).
-            - **NumPy:** Operaciones vectorizadas sobre 14,400+ filas, control seguro de divisiones (`np.where`), normalización Min-Max, puntaje compuesto por producto punto (`np.dot`), clasificación condicional multicriterio (`np.select`), percentiles de mercado (`np.percentile`), regresión lineal de tendencia (`np.polyfit` / `np.polyval`) y análisis de sensibilidad 2D (`np.meshgrid`).
-            - **Cruce de catálogos externos:** Comparación priorizada por `EAN_UPC`, `Partida_Arancelaria` DIAN y similitud textual (`difflib.SequenceMatcher` + coincidencia de palabras clave).
+            - **Pandas:** Lectura/exportación CSV, fusión dinámica (`pd.concat`), indexación booleana múltiple
+              (`.isin()`, `.between()`), agregaciones avanzadas (`groupby().agg()`), series de tiempo
+              (`pd.to_datetime`) y matrices de correlación (`.corr()`).
+            - **NumPy:** Operaciones vectorizadas sobre 14,400+ filas, control seguro de divisiones (`np.where`),
+              normalización Min-Max, puntaje compuesto por producto punto (`np.dot`), clasificación condicional
+              multicriterio (`np.select`), percentiles de mercado (`np.percentile`), regresión lineal de tendencia
+              (`np.polyfit` / `np.polyval`) y análisis de sensibilidad 2D (`np.meshgrid`).
             """
         )
 
