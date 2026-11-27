@@ -75,18 +75,25 @@ CUSTOM_CSS = """
     }
     div[data-testid="stMetric"] {
         background-color: #FFFFFF;
+        color: #0F172A !important;
         border: 1px solid #E2E8F0;
         padding: 0.95rem 1.1rem;
         border-radius: 12px;
         box-shadow: 0 2px 8px rgba(15, 23, 42, 0.04);
     }
-    div[data-testid="stMetric"] label {
+    div[data-testid="stMetric"] label,
+    div[data-testid="stMetricLabel"] p {
         color: #475569 !important;
         font-weight: 600 !important;
         font-size: 0.84rem !important;
     }
+    div[data-testid="stMetricValue"],
+    div[data-testid="stMetricValue"] > div {
+        color: #0F172A !important;
+    }
     .insight-card {
         background-color: #FFFFFF;
+        color: #1E293B !important;
         border-left: 5px solid #1E3A8A;
         padding: 1rem 1.25rem;
         border-radius: 10px;
@@ -94,6 +101,20 @@ CUSTOM_CSS = """
         border-right: 1px solid #E2E8F0;
         border-bottom: 1px solid #E2E8F0;
         margin-bottom: 1rem;
+    }
+    .insight-card p,
+    .insight-card span,
+    .insight-card b,
+    .insight-card strong,
+    .insight-card li,
+    .insight-card div {
+        color: #1E293B !important;
+    }
+    .insight-card code {
+        background-color: #E2E8F0 !important;
+        color: #0F172A !important;
+        padding: 0.1rem 0.35rem;
+        border-radius: 5px;
     }
     .insight-green { border-left-color: #10B981; }
     .insight-amber { border-left-color: #F59E0B; }
@@ -453,12 +474,14 @@ with tab1:
         fig_scatter.add_vline(x=radar_df["Margen_Bruto_Pct"].median(), line_dash="dot", line_color="#94A3B8")
         fig_scatter.add_hline(y=radar_df["Tasa_Rotacion_Pct"].median(), line_dash="dot", line_color="#94A3B8")
         fig_scatter.update_layout(
+            template="plotly_white",
             plot_bgcolor="#FFFFFF",
             paper_bgcolor="#FFFFFF",
+            font=dict(color="#1E293B"),
             margin=dict(l=10, r=10, t=20, b=10),
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         )
-        st.plotly_chart(fig_scatter, use_container_width=True)
+        st.plotly_chart(fig_scatter, use_container_width=True, theme=None)
 
     with col_g2:
         cat_resumen = (
@@ -483,13 +506,15 @@ with tab1:
         )
         fig_cat.update_traces(textposition="outside")
         fig_cat.update_layout(
+            template="plotly_white",
             title="Ventas y Margen por Categoría (10 Rubros)",
             plot_bgcolor="#FFFFFF",
             paper_bgcolor="#FFFFFF",
+            font=dict(color="#1E293B"),
             margin=dict(l=10, r=55, t=40, b=10),
             coloraxis_colorbar=dict(title="Margen %"),
         )
-        st.plotly_chart(fig_cat, use_container_width=True)
+        st.plotly_chart(fig_cat, use_container_width=True, theme=None)
 
     st.markdown("### 🏆 Ranking Comercial de Productos Importados")
     col_rk1, col_rk2 = st.columns([2, 1])
@@ -605,8 +630,8 @@ with tab2:
             title=f"Distribución del Portafolio ({len(radar_df)} SKUs)",
             height=390,
         )
-        fig_donut.update_layout(paper_bgcolor="#FFFFFF", margin=dict(l=10, r=10, t=45, b=10))
-        st.plotly_chart(fig_donut, use_container_width=True)
+        fig_donut.update_layout(template="plotly_white", paper_bgcolor="#FFFFFF", font=dict(color="#1E293B"), margin=dict(l=10, r=10, t=45, b=10))
+        st.plotly_chart(fig_donut, use_container_width=True, theme=None)
 
     with col_r2:
         top_riesgo = radar_df.sort_values("Capital_Inmovilizado_COP", ascending=False).head(12)
@@ -625,8 +650,8 @@ with tab2:
             labels={"Capital_Inmovilizado_COP": "Capital Estancado (COP)", "Producto": ""},
             height=390,
         )
-        fig_riesgo.update_layout(plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF", margin=dict(l=10, r=10, t=45, b=10))
-        st.plotly_chart(fig_riesgo, use_container_width=True)
+        fig_riesgo.update_layout(template="plotly_white", plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF", font=dict(color="#1E293B"), margin=dict(l=10, r=10, t=45, b=10))
+        st.plotly_chart(fig_riesgo, use_container_width=True, theme=None)
 
     filtro_sem = st.radio(
         "Filtrar listado completo por semáforo:",
@@ -819,12 +844,14 @@ with tab4:
             title=f"Comportamiento Histórico y Proyección de Demanda — {cat_pronostico}",
             xaxis_title="Mes",
             yaxis_title="Unidades Vendidas",
+            template="plotly_white",
             plot_bgcolor="#FFFFFF",
             paper_bgcolor="#FFFFFF",
+            font=dict(color="#1E293B"),
             height=400,
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         )
-        st.plotly_chart(fig_ts, use_container_width=True)
+        st.plotly_chart(fig_ts, use_container_width=True, theme=None)
 
         est_mes = df_trend.groupby("Mes", as_index=False)["Unidades_Vendidas"].mean()
         mes_pico = int(est_mes.loc[est_mes["Unidades_Vendidas"].idxmax(), "Mes"])
@@ -858,8 +885,8 @@ with tab4:
             labels={"Nombre_Mes": "Mes", "Unidades_Vendidas": "Unidades Promedio"},
             height=360,
         )
-        fig_est.update_layout(plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF", showlegend=False)
-        st.plotly_chart(fig_est, use_container_width=True)
+        fig_est.update_layout(template="plotly_white", plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF", font=dict(color="#1E293B"), showlegend=False)
+        st.plotly_chart(fig_est, use_container_width=True, theme=None)
 
     with col_e2:
         ciudad_res = (
@@ -879,8 +906,8 @@ with tab4:
             height=360,
         )
         fig_ciu.update_traces(textposition="outside")
-        fig_ciu.update_layout(plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF")
-        st.plotly_chart(fig_ciu, use_container_width=True)
+        fig_ciu.update_layout(template="plotly_white", plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF", font=dict(color="#1E293B"))
+        st.plotly_chart(fig_ciu, use_container_width=True, theme=None)
 
 # ------------------------------------------------------------------------------
 # TAB 5: EXPLORADOR DE BASE DE DATOS Y ANÁLISIS ESTADÍSTICO
