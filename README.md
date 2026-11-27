@@ -11,4 +11,8 @@ Integrantes:
 - Carga de archivos CSV adicionales en modo **Combinar (`pd.concat`)** o **Reemplazar**.
 - Pestana **Agregar Datos en Vivo** para registrar nuevas importaciones directamente desde la web.
 - Descarga de plantilla CSV y descarga de la base maestra actualizada.
-- - **Manejo de SKUs externos:** Acepta los códigos SKU propios de cada empresa en la plantilla (sin necesidad de adivinarlos ni exigir `SR-`). Si un archivo viene sin SKU, se proyecta generarlos automáticamente con `pd.factorize`, y usar código de barras (EAN/UPC) o partida arancelaria para cruzar productos contra el mercado.
+- Compatibilidad con **SKUs propios** en la plantilla CSV: acepta cualquier código interno de la empresa (ej. `EMP-001`) sin exigir prefijo `SR-`.
+
+## Próximas mejoras (basadas en comentarios de clase)
+- Lectura directa de archivos Excel (`.xlsx`) y generación automática de SKU con `pd.factorize` cuando el archivo no traiga esa columna.
+- Cruce de productos externos contra la base de mercado usando código de barras (EAN/UPC) o partida arancelaria DIAN.
